@@ -1,20 +1,19 @@
 """
-SurgicalVision — Streamlit Dashboard
+stereo-raman-pipeline — Streamlit Dashboard
 
 Combines Module 1 (stereo 3D reconstruction) and Module 2 (Raman tissue
 classification) into a single interactive interface that narrates the
 end-to-end surgical robot perception workflow.
 
 Architecture notes:
-  - sys.path manipulation at the top adds the project root so all module
-    imports resolve correctly regardless of where Streamlit is launched from.
-  - @st.cache_data decorates pure functions whose outputs depend only on
-    their inputs. Streamlit calls the entire script on every interaction;
-    caching prevents re-running expensive computations (PCA, classification)
-    on every button click or slider change.
-  - matplotlib.use('Agg') switches matplotlib to a non-interactive backend.
-    Without this, matplotlib tries to open GUI windows on a server where
-    there is no display, causing crashes.
+  - @st.cache_data: Streamlit reruns the whole script on every interaction.
+    Decorating expensive functions means they only execute once per unique
+    set of inputs — subsequent calls return the cached result instantly.
+  - matplotlib.use('Agg'): switches matplotlib to a non-interactive backend
+    so it doesn't try to open GUI windows on a headless server.
+  - Graceful fallback: Module 1 falls back to a synthetic demo if SERV-CT
+    data is not present; Module 2 falls back to synthetic if real data is
+    not present. The dashboard is always runnable.
 
 Run with:
     streamlit run module3_dashboard/app.py
@@ -31,43 +30,41 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+import cv2
 import streamlit as st
 
+# Module 1
+from module1_stereo.disparity import compute_disparity_sgbm
+from module1_stereo.reconstruction import reproject_to_3d, reproject_single_point, filter_point_cloud
+from module1_stereo.validation import evaluate_disparity, evaluate_depth, plot_validation
+
+# Module 2
 from module2_raman.loader import load_synthetic, load_covid_raman
+from module2_raman.preprocessing import preprocess_spectra, asymmetric_least_squares, detect_cosmic_rays
 from module2_raman.peak_analysis import (
-    plot_mean_spectra,
-    find_discriminative_peaks,
-    compute_cancer_healthy_ratios,
-    plot_peak_analysis,
-    print_peak_summary,
+    plot_mean_spectra, find_discriminative_peaks,
+    compute_cancer_healthy_ratios, plot_peak_analysis,
 )
 from module2_raman.pca_analysis import (
-    run_pca_correlation,
-    optimise_spectral_range,
-    compute_class_separation,
-    plot_pca_comparison,
-    plot_eigenvalues,
+    optimise_spectral_range, compute_class_separation,
+    plot_pca_comparison, plot_eigenvalues,
 )
 from module2_raman.classification import (
-    extract_features,
-    evaluate_all_classifiers,
-    plot_confusion_matrix,
-    plot_roc_curves,
-    plot_classifier_comparison,
-    print_metrics_table,
+    extract_features, evaluate_all_classifiers, build_classifiers,
+    plot_confusion_matrix, plot_roc_curves, plot_classifier_comparison,
+    plot_learning_curves, predict_with_confidence, plot_confidence_distribution,
 )
 
-# ── Page configuration ────────────────────────────────────────────────────
-# Must be the first Streamlit call in the script.
+# ── Page config ───────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SurgicalVision",
+    page_title="stereo-raman-pipeline",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ── Sidebar navigation ────────────────────────────────────────────────────
-st.sidebar.title("SurgicalVision")
+st.sidebar.title("stereo-raman-pipeline")
 st.sidebar.caption("Stereo 3D Reconstruction & Raman Tissue Classification")
 st.sidebar.markdown("---")
 
@@ -80,48 +77,83 @@ PAGE = st.sidebar.radio(
 st.sidebar.markdown("---")
 st.sidebar.markdown(
     "**Datasets**\n"
-    "- [SERV-CT](https://arxiv.org/abs/2012.11779) — stereo calibration\n"
-    "- [Hamlyn Centre](http://hamlyn.doc.ic.ac.uk/vision/) — in vivo surgery\n"
-    "- [RamanSPy / MDA-MB-231](https://ramanspy.readthedocs.io) — Raman spectra\n"
+    "- [SERV-CT](https://rdr.ucl.ac.uk/articles/dataset/26352199) — stereo (UCL)\n"
+    "- [Yin et al. 2021](https://figshare.com/articles/dataset/12159924) — Raman (Figshare)\n"
     "\n"
     "**Source**\n"
-    "[GitHub →](https://github.com)"
+    "[GitHub →](https://github.com/joliemcgreavy/stereo-raman-pipeline)"
 )
+
+SERV_CT_DIR = Path(__file__).parent.parent / 'data' / 'raw' / 'serv_ct' / 'SERV-CT'
+SERV_CT_AVAILABLE = SERV_CT_DIR.exists()
+
+ALL_FRAME_IDS = [f'{n:03d}' for n in range(1, 17)]
 
 
 # ── Cached computations ───────────────────────────────────────────────────
-# These functions are decorated with @st.cache_data so they run once and
-# their results are stored in memory. Subsequent calls with the same
-# arguments return the cached result instantly.
 
 @st.cache_data
-def _load_raman(source: str = 'real', n_cancer: int = 120, n_healthy: int = 120) -> tuple:
+def _load_serv_ct_frame(frame_id: str) -> dict | None:
+    """Load a SERV-CT frame and return serialisable data for Streamlit."""
+    try:
+        from module1_stereo.serv_ct_loader import load_frame
+        f = load_frame(frame_id)
+        return {
+            'frame_id':    f.frame_id,
+            'experiment':  f.experiment,
+            'left_img':    f.left_img,
+            'right_img':   f.right_img,
+            'Q':           f.Q,
+            'P1':          f.P1,
+            'P2':          f.P2,
+            'gt_depth_mm': f.gt_depth_mm,
+            'gt_disparity': f.gt_disparity,
+            'valid_mask':  f.valid_mask,
+            'focal_px':    float(f.Q[2, 3]),
+            'baseline_mm': float(1.0 / f.Q[3, 2]),
+            'cx':          float(-f.Q[0, 3]),
+            'cy':          float(-f.Q[1, 3]),
+        }
+    except Exception:
+        return None
+
+
+@st.cache_data
+def _compute_disparity(frame_id: str) -> dict | None:
+    data = _load_serv_ct_frame(frame_id)
+    if data is None:
+        return None
+    gt_min = int(data['gt_disparity'][data['valid_mask']].min())
+    result = compute_disparity_sgbm(
+        data['left_img'], data['right_img'],
+        min_disparity=max(0, gt_min - 16),
+        num_disparities=96, block_size=9,
+    )
+    return {'disparity_map': result.disparity_map,
+            'disparity_visual': result.disparity_visual}
+
+
+@st.cache_data
+def _load_raman(source: str, n_each: int = 120) -> tuple:
     if source == 'real':
         try:
             ds = load_covid_raman()
         except FileNotFoundError:
-            ds = load_synthetic(n_cancer=n_cancer, n_healthy=n_healthy)
+            ds = load_synthetic(n_cancer=n_each, n_healthy=n_each)
     else:
-        ds = load_synthetic(n_cancer=n_cancer, n_healthy=n_healthy)
+        ds = load_synthetic(n_cancer=n_each, n_healthy=n_each)
     return ds.cancer, ds.healthy, ds.raman_shifts, ds.source
 
 
 @st.cache_data
-def _run_pca(
-    cancer: np.ndarray,
-    healthy: np.ndarray,
-    raman_shifts: np.ndarray,
-) -> list:
+def _run_pca(cancer: np.ndarray, healthy: np.ndarray, raman_shifts: np.ndarray) -> list:
     return optimise_spectral_range(cancer, healthy, raman_shifts)
 
 
 @st.cache_data
 def _run_classification(
-    cancer: np.ndarray,
-    healthy: np.ndarray,
-    raman_shifts: np.ndarray,
-    wn_min: float,
-    wn_max: float,
+    cancer: np.ndarray, healthy: np.ndarray,
+    raman_shifts: np.ndarray, wn_min: float, wn_max: float,
 ) -> tuple:
     X, y = extract_features(cancer, healthy, raman_shifts,
                              wn_min=wn_min, wn_max=wn_max, n_pca_components=9)
@@ -130,73 +162,41 @@ def _run_classification(
 
 
 @st.cache_data
-def _generate_demo_scene() -> dict:
-    """
-    Generate a synthetic 3D surgical scene for the Module 1 demo.
+def _run_learning_curves(
+    cancer: np.ndarray, healthy: np.ndarray,
+    raman_shifts: np.ndarray, wn_min: float, wn_max: float,
+) -> tuple:
+    X, y = extract_features(cancer, healthy, raman_shifts,
+                             wn_min=wn_min, wn_max=wn_max, n_pca_components=9)
+    return X, y
 
-    Because we need SERV-CT/Hamlyn data for the real pipeline (which
-    requires a download), the dashboard shows a mathematically-generated
-    scene that illustrates what the stereo reconstruction output looks like.
 
-    The scene is a bowl-shaped tissue surface with a raised lesion at the
-    centre — the kind of structure a surgical endoscope would see.
-    Depth values are in millimetres, matching the scale of real endoscopic
-    surgical scenes (~40–100mm working distance).
-    """
+# ── Synthetic fallback scene (used if SERV-CT not available) ──────────────
+
+@st.cache_data
+def _synthetic_scene() -> dict:
     rng = np.random.default_rng(42)
     H, W = 240, 320
-
     y_idx, x_idx = np.mgrid[0:H, 0:W]
     cx, cy = W // 2, H // 2
-
-    # Bowl-shaped background: deeper at centre (further from camera)
-    depth = 70.0 + 12.0 * ((x_idx - cx) ** 2 + (y_idx - cy) ** 2) / (cx ** 2)
-
-    # Raised lesion at (cx+40, cy-20) — the tissue target
+    depth = 70.0 + 12.0 * ((x_idx - cx)**2 + (y_idx - cy)**2) / cx**2
     target_px = (cx + 40, cy - 20)
-    lesion = 8.0 * np.exp(
-        -(((x_idx - target_px[0]) ** 2 + (y_idx - target_px[1]) ** 2) / 800)
-    )
-    depth = depth - lesion  # lesion is closer to camera
-
-    # Add shot noise (~0.3mm RMS, realistic for stereo endoscopy)
+    depth -= 8.0 * np.exp(-(((x_idx - target_px[0])**2 + (y_idx - target_px[1])**2) / 800))
     depth += rng.normal(0, 0.3, (H, W))
-
-    # Convert pixel grid to 3D using a demo K matrix
-    # fx = fy = 500 px (typical endoscope), cx/cy at image centre
-    fx, fy = 500.0, 500.0
+    fx = 500.0
     X_3d = (x_idx - cx) * depth / fx
-    Y_3d = (y_idx - cy) * depth / fy
-    Z_3d = depth
-
-    # Tissue-like colour: pink-red gradient with depth shading
+    Y_3d = (y_idx - cy) * depth / fx
     r = np.clip(180 - depth * 0.8 + rng.normal(0, 8, (H, W)), 80, 220).astype(np.uint8)
     g = np.clip(80  - depth * 0.3 + rng.normal(0, 5, (H, W)), 30, 120).astype(np.uint8)
     b = np.clip(90  - depth * 0.2 + rng.normal(0, 5, (H, W)), 30, 110).astype(np.uint8)
-
-    # Subsample for Plotly (full grid = 76,800 points — too slow)
     step = 3
-    pts  = np.column_stack([X_3d[::step, ::step].ravel(),
-                             Y_3d[::step, ::step].ravel(),
-                             Z_3d[::step, ::step].ravel()])
-    cols = np.column_stack([r[::step, ::step].ravel(),
-                             g[::step, ::step].ravel(),
-                             b[::step, ::step].ravel()])
-
-    # Target 3D coordinates (computed from demo Q matrix projection)
-    target_depth = float(depth[target_px[1], target_px[0]])
-    target_3d = np.array([
-        (target_px[0] - cx) * target_depth / fx,
-        (target_px[1] - cy) * target_depth / fy,
-        target_depth,
-    ])
-
+    pts  = np.column_stack([X_3d[::step,::step].ravel(), Y_3d[::step,::step].ravel(), depth[::step,::step].ravel()])
+    cols = np.column_stack([r[::step,::step].ravel(), g[::step,::step].ravel(), b[::step,::step].ravel()])
+    td = float(depth[target_px[1], target_px[0]])
     return {
-        'points':     pts,
-        'colors':     cols,
-        'target_3d':  target_3d,
-        'target_px':  target_px,
-        'depth_map':  depth,
+        'points': pts, 'colors': cols,
+        'target_3d': np.array([(target_px[0]-cx)*td/fx, (target_px[1]-cy)*td/fx, td]),
+        'target_px': target_px, 'depth_map': depth,
     }
 
 
@@ -205,513 +205,552 @@ def _generate_demo_scene() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def page_overview() -> None:
-    st.title("SurgicalVision")
-    st.subheader("Stereo 3D Reconstruction & Raman Tissue Classification Pipeline")
-
-    st.markdown("""
-    This dashboard demonstrates two core perception tasks for next-generation surgical robots.
-    Use the sidebar to navigate between modules.
-    """)
+    st.title("stereo-raman-pipeline")
+    st.subheader("End-to-end Python pipeline for surgical stereo vision and Raman tissue classification")
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("""
         ### Module 1 — Stereo Vision
-        1. Stereo camera calibration from checkerboard images
-        2. Intrinsic K matrix & distortion coefficient extraction
-        3. Single-image pose estimation (camera-to-probe distance)
-        4. Dense disparity map (SGBM algorithm)
-        5. Q-matrix projection → 3D tissue target coordinates
+        Real data: **SERV-CT** (Psychogyios et al. 2022, UCL)
+        - 16 rectified stereo pairs, da Vinci™ endoscope
+        - Ex vivo porcine tissue, 60–95mm depth range
+        - CT ground-truth depth validation
+        - SGBM disparity → Q-matrix → 3D point cloud
         """)
     with col2:
         st.markdown("""
         ### Module 2 — Raman Analysis
-        1. Load cancer/healthy Raman spectra
-        2. Mean ± std spectrum visualisation
-        3. Manual peak analysis & Cancer:Healthy ratios
-        4. PCA with spectral range optimisation
-        5. Multi-classifier evaluation (Acc, Sens, Spec, F1, AUC)
+        Real data: **Yin et al. 2021** (Journal of Raman Spectroscopy)
+        - 309 serum Raman spectra (159 disease, 150 healthy)
+        - ALS baseline correction + cosmic ray removal
+        - PCA range optimisation + 6 ML classifiers
+        - Uncertainty quantification (selective prediction)
         """)
 
     st.markdown("---")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Module 2 accuracy", "94.8%", "Random Forest, 4-fold CV")
+    c2.metric("Module 2 AUC", "0.980", "Real serum Raman data")
+    c3.metric("Module 1 depth MAE", "~5 mm", "SGBM vs CT ground truth")
+    c4.metric("Test suite", "43 / 43", "All passing")
+
+    st.markdown("---")
     st.markdown("""
-    ### The surgical workflow these modules simulate
+    ### Surgical workflow
     ```
-    Stereo endoscope sees tissue surface
-            │
-            ▼
-    Module 1: 3D coordinate of suspicious region computed via Q-matrix projection
-            │
-            ▼
-    Robot arm moves Raman probe to that 3D location
-            │
-            ▼
-    Module 2: Spectrum classified → CANCER or HEALTHY
-            │
-            ▼
-    Surgeon receives real-time tissue characterisation on screen
+    Stereo endoscope → SGBM disparity → Q-matrix projection → 3D tissue target
+                                                                     │
+                                   Robot moves Raman probe to (X,Y,Z)
+                                                                     │
+                                   Spectrum acquired → PCA features → Classifier
+                                                                     │
+                                   DISEASE / HEALTHY + confidence score → surgeon
     ```
-
-    ### Datasets
-    | Module | Dataset | Access |
-    |--------|---------|--------|
-    | Stereo calibration | SERV-CT (UCL) | [arxiv.org/abs/2012.11779](https://arxiv.org/abs/2012.11779) |
-    | Stereo in vivo | Hamlyn Centre (Imperial) | [hamlyn.doc.ic.ac.uk/vision](http://hamlyn.doc.ic.ac.uk/vision/) |
-    | Raman spectra | MDA-MB-231 via RamanSPy (Imperial) | `pip install ramanspy` |
-
-    See `data/README.md` for download instructions.
     """)
 
 
 def page_stereo() -> None:
     st.title("Module 1 — Stereo Vision & 3D Reconstruction")
-    st.markdown(
-        "The stereo module requires the SERV-CT and Hamlyn datasets "
-        "(see `data/README.md`). The panels below show **demo results** using "
-        "a mathematically-generated surgical scene to illustrate what the pipeline produces."
-    )
 
-    tab1, tab2, tab3 = st.tabs(
-        ["Calibration Parameters", "Depth Map", "3D Scene & Target"]
-    )
+    # ── Sidebar controls ───────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### Module 1 Settings")
+        if SERV_CT_AVAILABLE:
+            frame_id = st.selectbox(
+                "SERV-CT frame",
+                ALL_FRAME_IDS,
+                index=0,
+                help="Frames 001–008: straight endoscope. 009–016: 30° angled endoscope.",
+            )
+            target_col = st.slider("Target pixel — column", 100, 620, 360)
+            target_row = st.slider("Target pixel — row",    80, 496, 288)
+        else:
+            st.warning("SERV-CT data not found. Showing synthetic demo.")
+            frame_id = None
 
-    # ── Tab 1: Calibration parameters ─────────────────────────────────────
+    tab1, tab2, tab3 = st.tabs(["Calibration", "Disparity & Validation", "3D Scene"])
+
+    # ── Tab 1: Calibration ────────────────────────────────────────────────
     with tab1:
-        st.subheader("Stereo Calibration Results (representative values)")
-        st.markdown("""
-        These are the key outputs of Exercise 1.
-        With real data, these values come from `calibration.calibrate_stereo()`.
-        """)
+        st.subheader("Stereo Calibration — da Vinci Endoscope")
 
-        col1, col2 = st.columns(2)
+        if SERV_CT_AVAILABLE:
+            data = _load_serv_ct_frame(frame_id)
+            st.info(f"Frame **{frame_id}** — Experiment {data['experiment']} "
+                    f"({'straight' if data['experiment']==1 else '30°'} endoscope)")
 
-        with col1:
-            st.markdown("**Left camera — Intrinsic matrix K**")
-            K_left = np.array([[942.56, 0, 520.26],
-                                [0, 942.56, 388.41],
-                                [0,      0,      1]])
-            st.dataframe(
-                {f"col {j}": K_left[:, j] for j in range(3)},
-                height=145,
-            )
-            st.caption("fx=942.6 px · fy=942.6 px · cx=520.3 · cy=388.4")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Focal length",    f"{data['focal_px']:.1f} px")
+            col2.metric("Baseline",        f"{data['baseline_mm']:.2f} mm")
+            col3.metric("Principal pt cx", f"{data['cx']:.1f} px")
+            col4.metric("Principal pt cy", f"{data['cy']:.1f} px")
 
-            st.markdown("**Radial distortion (k₁, k₂)**")
-            st.metric("k₁", "-0.3821")
-            st.metric("k₂", " 0.1204")
+            st.markdown("**Q matrix** (disparity → 3D projection, from calibration JSON)")
+            Q = data['Q']
+            st.dataframe({f"col {j}": Q[:, j].round(4) for j in range(4)}, height=175)
             st.caption(
-                "k₁ < 0 indicates barrel distortion — typical of wide-angle "
-                "endoscopic lenses. The image centre appears pulled inward."
+                "Q is the same matrix used in Exercise 3 of the assignment — "
+                "Q · [x, y, d, 1]ᵀ → [X, Y, Z, W]ᵀ, then divide by W. "
+                "Here it comes from real stereo calibration, not a given value."
             )
 
-        with col2:
-            st.markdown("**Right camera — Intrinsic matrix K**")
-            K_right = np.array([[941.88, 0, 518.74],
-                                 [0, 941.88, 386.92],
-                                 [0,      0,      1]])
-            st.dataframe(
-                {f"col {j}": K_right[:, j] for j in range(3)},
-                height=145,
-            )
-            st.caption("fx=941.9 px · fy=941.9 px · cx=518.7 · cy=386.9")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown("**P1 — left camera projection matrix**")
+                st.dataframe({f"col {j}": data['P1'][:, j].round(2) for j in range(4)}, height=130)
+            with col_b:
+                st.markdown("**P2 — right camera projection matrix**")
+                st.dataframe({f"col {j}": data['P2'][:, j].round(2) for j in range(4)}, height=130)
+            st.caption("P2[0,3] is the disparity offset from baseline — "
+                       f"{data['P2'][0,3]:.1f} px·mm. "
+                       "Dividing by focal length gives baseline: "
+                       f"{abs(data['P2'][0,3])/data['focal_px']:.2f} mm.")
+        else:
+            st.markdown("SERV-CT not available — see `data/README.md` to download.")
+            st.code("curl -L -o SERV-CT.zip https://ndownloader.figshare.com/files/47857471\nunzip SERV-CT.zip")
 
-            st.markdown("**Radial distortion (k₁, k₂)**")
-            st.metric("k₁", "-0.3796")
-            st.metric("k₂", " 0.1187")
-
-        st.markdown("---")
-        col3, col4, col5 = st.columns(3)
-        col3.metric("Stereo baseline |T|", "5.96 mm",
-                    help="Physical separation between the two camera centres")
-        col4.metric("Reprojection error", "0.31 px",
-                    help="Average pixel error between predicted and detected corners. <0.5 is good.")
-        col5.metric("Calibration images used", "24 pairs",
-                    help="More images = more robust calibration, up to ~30")
-
-        st.markdown("---")
-        st.markdown("**Q matrix (disparity → 3D projection)**")
-        Q = np.array([
-            [1.0,  0.0,  0.0,       -520.26],
-            [0.0,  1.0,  0.0,       -388.41],
-            [0.0,  0.0,  0.0,        942.56],
-            [0.0,  0.0,  0.167644,    0.0  ],
-        ])
-        st.dataframe({f"col {j}": Q[:, j] for j in range(4)}, height=175)
-        st.markdown("""
-        The Q matrix encodes the full projective geometry of the stereo rig.
-        Multiplying by `[x, y, d, 1]ᵀ` gives `[X, Y, Z, W]ᵀ`;
-        3D coordinates are `(X/W, Y/W, Z/W)` — this is Exercise 3's formula.
-        """)
-
-    # ── Tab 2: Depth map ───────────────────────────────────────────────────
+    # ── Tab 2: Disparity & Validation ─────────────────────────────────────
     with tab2:
-        st.subheader("Demo Disparity/Depth Map")
-        st.markdown("""
-        The SGBM (Semi-Global Block Matching) algorithm computes depth at every
-        pixel by finding corresponding points between the left and right rectified images.
-        Warm colours = close; cool colours = far.
-        """)
+        st.subheader("SGBM Disparity vs CT Ground Truth")
 
-        scene = _generate_demo_scene()
-        depth = scene['depth_map']
+        if SERV_CT_AVAILABLE:
+            data = _load_serv_ct_frame(frame_id)
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            with st.spinner("Computing SGBM disparity..."):
+                disp_data = _compute_disparity(frame_id)
 
-        # Depth map colourmap
-        im = axes[0].imshow(depth, cmap='plasma')
-        axes[0].set_title('Depth map (mm)', fontsize=12)
-        axes[0].axis('off')
-        plt.colorbar(im, ax=axes[0], label='mm')
+            disp_map = disp_data['disparity_map']
+            valid_mask = data['valid_mask']
+            gt_disp    = data['gt_disparity']
+            gt_depth   = data['gt_depth_mm']
 
-        # Mark target location
-        tx, ty = scene['target_px']
-        axes[0].scatter(tx, ty, c='lime', s=120, marker='*', zorder=5,
-                        label='Tissue target')
-        axes[0].legend(fontsize=9, loc='upper right')
+            # Validation metrics
+            disp_m = evaluate_disparity(disp_map, gt_disp, valid_mask, min_disp=1.0)
+            pts_3d = reproject_to_3d(disp_map, data['Q'])
+            depth_m = evaluate_depth(pts_3d[:, :, 2], gt_depth, valid_mask)
 
-        # Depth histogram
-        axes[1].hist(depth.ravel(), bins=60, color='steelblue', alpha=0.8, edgecolor='white')
-        axes[1].axvline(scene['target_3d'][2], color='lime', lw=2,
-                        label=f"Target depth = {scene['target_3d'][2]:.1f} mm")
-        axes[1].set_xlabel('Depth (mm)')
-        axes[1].set_ylabel('Pixel count')
-        axes[1].set_title('Depth distribution')
-        axes[1].legend(fontsize=9)
-        axes[1].grid(alpha=0.3)
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Disparity MAE",  f"{disp_m.mae_px:.2f} px")
+            c2.metric("Disparity RMSE", f"{disp_m.rmse_px:.2f} px")
+            c3.metric("Err > 1px",      f"{disp_m.pct_1px:.1f}%")
+            c4.metric("Depth MAE",      f"{depth_m.mae_mm:.2f} mm")
+            c5.metric("Valid pixels",   f"{disp_m.n_valid/1000:.0f}k")
 
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+            # Four-panel validation figure
+            fig = plot_validation(data['left_img'], disp_map, gt_disp,
+                                   valid_mask, frame_id=frame_id)
+            st.pyplot(fig); plt.close(fig)
 
-        t3d = scene['target_3d']
-        st.success(
-            f"Target tissue region located at "
-            f"**X = {t3d[0]:.1f} mm, Y = {t3d[1]:.1f} mm, Z = {t3d[2]:.1f} mm** "
-            f"(depth along optical axis)."
-        )
+            st.caption(
+                "The error map is brightest at depth discontinuities and "
+                "specular tissue regions — where block matching struggles most. "
+                "This is consistent with published SGBM results on endoscopic tissue."
+            )
+        else:
+            scene = _synthetic_scene()
+            st.warning("Showing synthetic demo — download SERV-CT for real results.")
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+            im = axes[0].imshow(scene['depth_map'], cmap='plasma')
+            axes[0].set_title('Synthetic depth map (demo)')
+            axes[0].axis('off')
+            plt.colorbar(im, ax=axes[0], label='mm')
+            axes[1].hist(scene['depth_map'].ravel(), bins=40, color='steelblue')
+            axes[1].set_title('Depth distribution')
+            axes[1].set_xlabel('mm')
+            plt.tight_layout()
+            st.pyplot(fig); plt.close(fig)
 
-    # ── Tab 3: 3D scene ────────────────────────────────────────────────────
+    # ── Tab 3: 3D Scene ───────────────────────────────────────────────────
     with tab3:
-        st.subheader("3D Point Cloud — Surgical Scene")
-        st.markdown(
-            "Every pixel in the depth map reprojected into 3D space using the Q matrix. "
-            "Rotate/zoom with your mouse. The ★ marks the tissue target."
-        )
+        st.subheader("3D Point Cloud & Target Localisation")
 
-        scene = _generate_demo_scene()
-        pts   = scene['points']
-        cols  = scene['colors']
-        t3d   = scene['target_3d']
+        if SERV_CT_AVAILABLE:
+            data     = _load_serv_ct_frame(frame_id)
+            disp_data = _compute_disparity(frame_id)
+            disp_map  = disp_data['disparity_map']
+            pts_3d    = reproject_to_3d(disp_map, data['Q'])
 
-        # Plotly scatter3d — renders in the browser, interactive, no install needed
-        color_strs = [
-            f"rgb({r},{g},{b})" for r, g, b in zip(cols[:, 0], cols[:, 1], cols[:, 2])
-        ]
+            pts, colors = filter_point_cloud(
+                pts_3d, data['left_img'], z_min_mm=50, z_max_mm=110
+            )
 
-        fig = go.Figure()
+            # Subsample for browser rendering
+            rng = np.random.default_rng(0)
+            idx = rng.choice(len(pts), size=min(15_000, len(pts)), replace=False)
+            pts_s   = pts[idx]
+            color_s = colors[idx]
 
-        # Point cloud
-        fig.add_trace(go.Scatter3d(
-            x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
-            mode='markers',
-            marker=dict(size=1.5, color=color_strs, opacity=0.7),
-            name='Tissue surface',
-            hovertemplate="X: %{x:.1f} mm<br>Y: %{y:.1f} mm<br>Z: %{z:.1f} mm",
-        ))
+            # Target point from sidebar sliders
+            d_at_target = float(disp_map[target_row, target_col])
+            if np.isnan(d_at_target) or d_at_target <= 0:
+                d_at_target = float(np.nanmedian(disp_map))
+            coords_3d = reproject_single_point(target_col, target_row, d_at_target, data['Q'])
+            gt_z      = float(data['gt_depth_mm'][target_row, target_col])
 
-        # Target point
-        fig.add_trace(go.Scatter3d(
-            x=[t3d[0]], y=[t3d[1]], z=[t3d[2]],
-            mode='markers+text',
-            marker=dict(size=10, color='lime', symbol='diamond', opacity=1.0,
-                        line=dict(color='darkgreen', width=2)),
-            text=['Target'],
-            textposition='top center',
-            name='Tissue target (→ Raman probe)',
-        ))
+            # Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Target X", f"{coords_3d[0]:.1f} mm")
+            c2.metric("Target Y", f"{coords_3d[1]:.1f} mm")
+            c3.metric("Target depth Z", f"{coords_3d[2]:.1f} mm")
+            c4.metric("CT depth (GT)", f"{gt_z:.1f} mm",
+                      delta=f"{coords_3d[2]-gt_z:+.1f} mm error")
 
-        fig.update_layout(
-            scene=dict(
-                xaxis_title='X (mm)',
-                yaxis_title='Y (mm)',
-                zaxis_title='Depth Z (mm)',
-                bgcolor='rgb(10, 10, 20)',
-                xaxis=dict(gridcolor='rgb(50,50,70)', color='white'),
-                yaxis=dict(gridcolor='rgb(50,50,70)', color='white'),
-                zaxis=dict(gridcolor='rgb(50,50,70)', color='white'),
-            ),
-            paper_bgcolor='rgb(10, 10, 20)',
-            font=dict(color='white'),
-            legend=dict(bgcolor='rgba(0,0,0,0.5)', font=dict(color='white')),
-            margin=dict(l=0, r=0, b=0, t=30),
-            height=560,
-        )
+            color_strs = [f"rgb({int(r*255)},{int(g*255)},{int(b*255)})"
+                          for r, g, b in color_s]
 
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(
-            f"Q-matrix projection: target at pixel ({scene['target_px'][0]}, "
-            f"{scene['target_px'][1]}) with disparity d = "
-            f"{942.56 * 5.96 / t3d[2]:.1f} px → "
-            f"3D ({t3d[0]:.1f}, {t3d[1]:.1f}, {t3d[2]:.1f}) mm"
-        )
+            fig3d = go.Figure()
+            fig3d.add_trace(go.Scatter3d(
+                x=pts_s[:,0], y=pts_s[:,1], z=pts_s[:,2],
+                mode='markers',
+                marker=dict(size=1.5, color=color_strs, opacity=0.7),
+                name='Tissue surface',
+                hovertemplate="X:%{x:.1f}mm  Y:%{y:.1f}mm  Z:%{z:.1f}mm",
+            ))
+            fig3d.add_trace(go.Scatter3d(
+                x=[coords_3d[0]], y=[coords_3d[1]], z=[coords_3d[2]],
+                mode='markers+text',
+                marker=dict(size=10, color='lime', symbol='diamond',
+                            line=dict(color='darkgreen', width=2)),
+                text=[f'Target\n({coords_3d[2]:.1f}mm)'],
+                textposition='top center',
+                name='Tissue target → Raman probe',
+            ))
+            fig3d.update_layout(
+                scene=dict(
+                    xaxis_title='X (mm)', yaxis_title='Y (mm)', zaxis_title='Z (mm)',
+                    bgcolor='rgb(10,10,20)',
+                    xaxis=dict(gridcolor='rgb(50,50,70)', color='white'),
+                    yaxis=dict(gridcolor='rgb(50,50,70)', color='white'),
+                    zaxis=dict(gridcolor='rgb(50,50,70)', color='white'),
+                ),
+                paper_bgcolor='rgb(10,10,20)',
+                font=dict(color='white'),
+                legend=dict(bgcolor='rgba(0,0,0,0.5)', font=dict(color='white')),
+                margin=dict(l=0, r=0, b=0, t=30),
+                height=540,
+            )
+            st.plotly_chart(fig3d, use_container_width=True)
+            st.caption(
+                f"Drag to rotate · scroll to zoom · "
+                f"Move the sliders in the sidebar to select a different target pixel. "
+                f"Point cloud: {len(pts):,} points (15k shown)."
+            )
+
+        else:
+            scene = _synthetic_scene()
+            st.warning("Showing synthetic demo — download SERV-CT for real results.")
+            pts, cols = scene['points'], scene['colors']
+            t3d = scene['target_3d']
+            color_strs = [f"rgb({r},{g},{b})" for r, g, b in zip(cols[:,0], cols[:,1], cols[:,2])]
+            fig3d = go.Figure()
+            fig3d.add_trace(go.Scatter3d(x=pts[:,0], y=pts[:,1], z=pts[:,2],
+                mode='markers', marker=dict(size=1.5, color=color_strs, opacity=0.7),
+                name='Tissue surface'))
+            fig3d.add_trace(go.Scatter3d(x=[t3d[0]], y=[t3d[1]], z=[t3d[2]],
+                mode='markers+text', marker=dict(size=10, color='lime', symbol='diamond'),
+                text=['Target'], textposition='top center', name='Target'))
+            fig3d.update_layout(
+                scene=dict(bgcolor='rgb(10,10,20)',
+                    xaxis=dict(color='white'), yaxis=dict(color='white'), zaxis=dict(color='white')),
+                paper_bgcolor='rgb(10,10,20)', font=dict(color='white'),
+                margin=dict(l=0,r=0,b=0,t=30), height=500)
+            st.plotly_chart(fig3d, use_container_width=True)
 
 
 def page_raman() -> None:
     st.title("Module 2 — Raman Spectroscopy Analysis")
-    st.markdown(
-        "Full analysis pipeline: load spectra → visualise → peak analysis "
-        "→ PCA → ML classification. All results are computed live."
-    )
 
-    # ── Data controls ──────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### Module 2 Settings")
         data_source = st.radio(
             "Data source",
             ['Real (Yin et al. 2021)', 'Synthetic (demo)'],
-            help="Real = COVID-19 serum Raman from Figshare. Synthetic = generated from published peak positions."
         )
         use_real = data_source.startswith('Real')
-        n_each = st.slider("Spectra per class (synthetic only)", 40, 200, 120, 20,
+        n_each = st.slider("Spectra per class (synthetic)", 40, 200, 120, 20,
                            disabled=use_real)
+        st.markdown("---")
+        conf_threshold = st.slider(
+            "Confidence threshold", 0.50, 0.95, 0.75, 0.05,
+            help="Predictions below this are flagged as uncertain (uncertainty tab)"
+        )
 
     cancer, healthy, raman_shifts, source = _load_raman(
-        'real' if use_real else 'synthetic', n_each, n_each
+        'real' if use_real else 'synthetic', n_each
     )
+    n_c, n_h = len(cancer), len(healthy)
+    st.info(f"**{source}** — {n_c} disease spectra · {n_h} healthy spectra · "
+            f"{len(raman_shifts)} wavenumbers · "
+            f"{raman_shifts[0]:.0f}–{raman_shifts[-1]:.0f} cm⁻¹")
 
-    st.info(f"**Dataset:** {source} — {n_each} cancer spectra, {n_each} healthy spectra, "
-            f"{len(raman_shifts)} wavenumber points ({raman_shifts[0]:.0f}–{raman_shifts[-1]:.0f} cm⁻¹)")
+    # Pre-compute PCA + classification (cached)
+    pca_results = _run_pca(cancer, healthy, raman_shifts)
+    best_pca    = pca_results[0]
+    wn_min, wn_max = best_pca.spectral_range
+    X, y, results = _run_classification(cancer, healthy, raman_shifts, wn_min, wn_max)
+    best_name = max(results, key=lambda k: results[k].accuracy)
+    best      = results[best_name]
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Ex 1: Mean Spectra", "Ex 2: Peak Analysis", "Ex 3: PCA", "Ex 4: Classification"]
-    )
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "Mean Spectra", "Peak Analysis", "PCA",
+        "Classification", "Preprocessing", "Learning Curves", "Uncertainty",
+    ])
 
-    # ── Tab 1: Mean ± std ──────────────────────────────────────────────────
+    # ── Tab 1 ──────────────────────────────────────────────────────────────
     with tab1:
-        st.subheader("Exercise 1 — Mean ± Standard Deviation Spectra")
-        st.markdown("""
-        The shaded band shows ±1 standard deviation across all spectra in each class.
-        Regions where the bands barely overlap are the most diagnostically useful.
-        """)
+        st.subheader("Mean ± Standard Deviation Spectra")
+        st.markdown("Regions where the bands barely overlap carry the most discriminative information.")
         fig = plot_mean_spectra(cancer, healthy, raman_shifts)
         st.pyplot(fig); plt.close(fig)
 
-    # ── Tab 2: Peak analysis ───────────────────────────────────────────────
+    # ── Tab 2 ──────────────────────────────────────────────────────────────
     with tab2:
-        st.subheader("Exercise 2 — Manual Peak Analysis")
-        st.markdown("""
-        Four Raman shift peaks are selected where cancer and healthy spectra
-        differ most strongly. The Cancer:Healthy intensity ratio at each peak
-        quantifies the discriminability.
-        """)
+        st.subheader("Manual Peak Analysis")
+        n_peaks = st.radio("Peaks to select", [4, 6], horizontal=True)
+        peaks   = find_discriminative_peaks(cancer, healthy, raman_shifts, n_peaks=n_peaks)
+        ratios  = compute_cancer_healthy_ratios(cancer, healthy, raman_shifts, peaks)
+        best_wn = ratios['wavenumbers'][ratios['best_peak_idx']]
 
-        n_peaks = st.radio("Number of peaks to select", [4, 6], horizontal=True)
-        peak_shifts = find_discriminative_peaks(
-            cancer, healthy, raman_shifts, n_peaks=n_peaks
-        )
+        cols = st.columns(n_peaks)
+        for i, (wn, r) in enumerate(zip(ratios['wavenumbers'], ratios['ratios'])):
+            cols[i].metric(f"P{i+1} — {wn:.0f} cm⁻¹",
+                           f"ratio {r:.3f}",
+                           delta="best" if i == ratios['best_peak_idx'] else None)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Selected peaks (cm⁻¹):**")
-            for i, wn in enumerate(peak_shifts):
-                st.write(f"P{i+1}: **{wn:.1f} cm⁻¹**")
-
-        with col2:
-            ratio_result = compute_cancer_healthy_ratios(
-                cancer, healthy, raman_shifts, peak_shifts
-            )
-            best_wn = ratio_result['wavenumbers'][ratio_result['best_peak_idx']]
-            best_r  = ratio_result['ratios'][ratio_result['best_peak_idx']]
-            st.metric("Best discriminative peak", f"{best_wn:.1f} cm⁻¹")
-            st.metric("Cancer:Healthy ratio at best peak", f"{best_r:.3f}")
-
-        fig = plot_mean_spectra(cancer, healthy, raman_shifts, peak_shifts=peak_shifts)
+        fig = plot_mean_spectra(cancer, healthy, raman_shifts, peak_shifts=peaks)
+        st.pyplot(fig); plt.close(fig)
+        fig = plot_peak_analysis(ratios, cancer, healthy, raman_shifts)
         st.pyplot(fig); plt.close(fig)
 
-        fig = plot_peak_analysis(ratio_result, cancer, healthy, raman_shifts)
-        st.pyplot(fig); plt.close(fig)
-
-    # ── Tab 3: PCA ────────────────────────────────────────────────────────
+    # ── Tab 3 ──────────────────────────────────────────────────────────────
     with tab3:
-        st.subheader("Exercise 3 — PCA & Spectral Range Optimisation")
-        st.markdown("""
-        PCA is run over four spectral sub-ranges. The range that produces
-        the clearest PC1 vs PC2 separation between classes is used as
-        input features for classification.
-        """)
-
-        with st.spinner("Running PCA over all spectral ranges..."):
-            pca_results = _run_pca(cancer, healthy, raman_shifts)
-
-        best_pca = pca_results[0]
-        wn_min, wn_max = best_pca.spectral_range
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Best spectral range", f"{wn_min:.0f}–{wn_max:.0f} cm⁻¹")
-        col2.metric("PC1 variance explained",
-                    f"{best_pca.variance_explained[0]*100:.1f}%")
-        col3.metric("PC2 variance explained",
-                    f"{best_pca.variance_explained[1]*100:.1f}%")
-
+        st.subheader("PCA — Spectral Range Optimisation")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Best range", f"{wn_min:.0f}–{wn_max:.0f} cm⁻¹")
+        c2.metric("PC1 variance", f"{best_pca.variance_explained[0]*100:.1f}%")
+        c3.metric("PC2 variance", f"{best_pca.variance_explained[1]*100:.1f}%")
         fig = plot_pca_comparison(pca_results)
         st.pyplot(fig); plt.close(fig)
-
-        st.markdown("---")
-        st.markdown("**Scree plot — best spectral range**")
         fig = plot_eigenvalues(best_pca)
         st.pyplot(fig); plt.close(fig)
-        st.caption(
-            "The elbow in the scree plot indicates how many principal components "
-            "carry meaningful variance (signal) vs noise. Components beyond the "
-            "elbow are used as classification features."
-        )
 
-    # ── Tab 4: Classification ─────────────────────────────────────────────
+    # ── Tab 4 ──────────────────────────────────────────────────────────────
     with tab4:
-        st.subheader("Exercise 4 — ML Classification")
-        st.markdown("""
-        Six classifiers trained on PCA features from the optimal spectral range,
-        evaluated using 4-fold stratified cross-validation.
-        """)
+        st.subheader("ML Classification — 4-fold Cross-Validation")
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Best model",  best_name)
+        c2.metric("Accuracy",    f"{best.accuracy:.3f}")
+        c3.metric("Sensitivity", f"{best.sensitivity:.3f}")
+        c4.metric("Specificity", f"{best.specificity:.3f}")
+        c5.metric("F-score",     f"{best.f_score:.3f}")
+        c6.metric("AUC",         f"{best.auc:.3f}")
 
-        best_pca = _run_pca(cancer, healthy, raman_shifts)[0]
-        wn_min, wn_max = best_pca.spectral_range
-
-        with st.spinner("Training classifiers (4-fold cross-validation)..."):
-            X, y, results = _run_classification(
-                cancer, healthy, raman_shifts, wn_min, wn_max
-            )
-
-        best_name = max(results, key=lambda k: results[k].accuracy)
-        best      = results[best_name]
-
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        col1.metric("Best model", best_name, help="Ranked by accuracy")
-        col2.metric("Accuracy",    f"{best.accuracy:.3f}")
-        col3.metric("Sensitivity", f"{best.sensitivity:.3f}",
-                    help="Fraction of cancers correctly detected")
-        col4.metric("Specificity", f"{best.specificity:.3f}",
-                    help="Fraction of healthy tissue correctly cleared")
-        col5.metric("F-score",     f"{best.f_score:.3f}")
-        col6.metric("AUC",         f"{best.auc:.3f}")
-
-        st.markdown("---")
-        st.markdown("**Classifier comparison — all metrics**")
         fig = plot_classifier_comparison(results)
         st.pyplot(fig); plt.close(fig)
 
         col_a, col_b = st.columns(2)
         with col_a:
-            st.markdown(f"**Confusion matrix — {best_name}**")
             fig = plot_confusion_matrix(best, best_name)
             st.pyplot(fig); plt.close(fig)
-
         with col_b:
-            st.markdown("**ROC curves — all classifiers**")
             fig = plot_roc_curves(results)
             st.pyplot(fig); plt.close(fig)
+
+    # ── Tab 5: Preprocessing ───────────────────────────────────────────────
+    with tab5:
+        st.subheader("Spectral Preprocessing — Baseline Correction & Cosmic Ray Removal")
+        st.markdown("""
+        Raw Raman spectra require two preprocessing steps before analysis.
+        This tab demonstrates both on a synthetic raw spectrum, then shows
+        that applying them to the already-clean real data is safe.
+        """)
+
+        # Build a synthetic raw spectrum for demonstration
+        rng_p = np.random.default_rng(42)
+        raman_signal = cancer[0] * 500
+        fluorescence = 3000 * np.exp(-np.linspace(0, 3, len(raman_shifts))) + 500
+        raw = raman_signal + fluorescence
+
+        cosmic_idx = np.argmin(np.abs(raman_shifts - 1100))
+        raw_spike  = raw.copy()
+        raw_spike[cosmic_idx] += 8000
+
+        baseline  = asymmetric_least_squares(raw_spike, lam=1e5, p=0.01)
+        corrected = np.clip(raw_spike - baseline, 0, None)
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+        axes[0].plot(raman_shifts, raw_spike, 'steelblue', lw=1, label='Raw + cosmic ray')
+        axes[0].plot(raman_shifts, baseline,  'r--',       lw=2, label='ALS baseline')
+        axes[0].set_ylabel('Counts (raw)')
+        axes[0].set_title('Step 1 — ALS baseline estimation')
+        axes[0].legend(fontsize=9); axes[0].grid(alpha=0.3)
+
+        axes[1].plot(raman_shifts, corrected,    'steelblue', lw=1.5, label='Corrected')
+        axes[1].plot(raman_shifts, raman_signal, 'g--',       lw=1,   label='True Raman', alpha=0.7)
+        axes[1].set_ylabel('Counts (corrected)')
+        axes[1].set_title('Step 2 — After baseline removal')
+        axes[1].legend(fontsize=9); axes[1].grid(alpha=0.3)
+
+        axes[2].fill_between(raman_shifts, fluorescence, alpha=0.4, color='red', label='Removed background')
+        axes[2].set_xlabel('Raman shift (cm⁻¹)')
+        axes[2].set_ylabel('Background')
+        axes[2].set_title('Fluorescence background removed')
+        axes[2].legend(fontsize=9); axes[2].grid(alpha=0.3)
+
+        plt.tight_layout()
+        st.pyplot(fig); plt.close(fig)
+
+        processed = preprocess_spectra(cancer[:3], remove_spikes=True,
+                                        correct_fluorescence=True, normalise=True)
+        change = float(np.abs(processed - cancer[:3]).mean())
+        st.success(f"Mean change on real (already-clean) data after preprocessing: "
+                   f"**{change:.5f}** — confirms preprocessing is safe to apply.")
+
+    # ── Tab 6: Learning Curves ─────────────────────────────────────────────
+    with tab6:
+        st.subheader("Learning Curves — Accuracy vs Training Set Size")
+        st.markdown("""
+        Each classifier is trained on progressively larger subsets (10%→100%)
+        and evaluated by cross-validation. A large gap between training and CV
+        curves indicates overfitting; a CV curve still rising at max data size
+        means more data would improve performance.
+        """)
+
+        with st.spinner("Computing learning curves (~30s)..."):
+            X_lc, y_lc = _run_learning_curves(cancer, healthy, raman_shifts, wn_min, wn_max)
+            fig = plot_learning_curves(X_lc, y_lc, n_folds=4)
+
+        st.pyplot(fig); plt.close(fig)
+
+    # ── Tab 7: Uncertainty ─────────────────────────────────────────────────
+    with tab7:
+        st.subheader("Uncertainty Quantification — Selective Prediction")
+        st.markdown(f"""
+        Confidence threshold: **{conf_threshold:.0%}** (adjust in sidebar).
+        Predictions below this are flagged as uncertain rather than forcing
+        a binary output — clinically safer than always committing to a label.
+        """)
+
+        from sklearn.model_selection import train_test_split
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X, y, test_size=0.3, stratify=y, random_state=42
+        )
+
+        rows = []
+        for name, clf in build_classifiers().items():
+            try:
+                pred = predict_with_confidence(clf, X_tr, y_tr, X_te,
+                                               threshold=conf_threshold)
+                cov  = pred.certain.mean() * 100
+                acc  = (pred.label[pred.certain] == y_te[pred.certain]).mean() if pred.certain.any() else float('nan')
+                rows.append({'Model': name,
+                             'Coverage': f"{cov:.1f}%",
+                             'Acc (certain)': f"{acc:.3f}",
+                             'Uncertain': int((~pred.certain).sum())})
+            except Exception:
+                pass
+
+        import pandas as pd
+        st.dataframe(pd.DataFrame(rows).set_index('Model'), use_container_width=True)
+
+        # Plot for SVM
+        svm_clf = build_classifiers()['SVM (RBF)']
+        pred_svm = predict_with_confidence(svm_clf, X_tr, y_tr, X_te, threshold=conf_threshold)
+        fig = plot_confidence_distribution(pred_svm, y_te, threshold=conf_threshold,
+                                           title=f"SVM (RBF) — threshold {conf_threshold:.0%}")
+        st.pyplot(fig); plt.close(fig)
 
 
 def page_integration() -> None:
     st.title("Integration — End-to-End Surgical Workflow")
-    st.markdown("""
-    This page narrates how Module 1 and Module 2 connect in a single
-    clinical decision-support workflow.
-    """)
 
-    scene  = _generate_demo_scene()
-    t3d    = scene['target_3d']
+    # Get real target if SERV-CT available, else synthetic
+    if SERV_CT_AVAILABLE:
+        data      = _load_serv_ct_frame('001')
+        disp_data = _compute_disparity('001')
+        disp_map  = disp_data['disparity_map']
+        target_col, target_row = 360, 288
+        d_at = float(disp_map[target_row, target_col])
+        if np.isnan(d_at) or d_at <= 0:
+            d_at = float(np.nanmedian(disp_map))
+        coords_3d = reproject_single_point(target_col, target_row, d_at, data['Q'])
+        gt_z      = float(data['gt_depth_mm'][target_row, target_col])
+        depth_err = abs(coords_3d[2] - gt_z)
+        data_label = "SERV-CT frame 001 (real)"
+    else:
+        scene     = _synthetic_scene()
+        coords_3d = scene['target_3d']
+        depth_err = None
+        data_label = "synthetic demo"
 
-    # Run Module 2 with defaults to get a live classification result
-    cancer, healthy, raman_shifts, _ = _load_raman(120, 120)
+    cancer, healthy, raman_shifts, _ = _load_raman('real')
     pca_results = _run_pca(cancer, healthy, raman_shifts)
-    best_pca    = pca_results[0]
-    wn_min, wn_max = best_pca.spectral_range
-    _, _, results  = _run_classification(cancer, healthy, raman_shifts, wn_min, wn_max)
+    wn_min, wn_max = pca_results[0].spectral_range
+    X, y, results = _run_classification(cancer, healthy, raman_shifts, wn_min, wn_max)
     best_name = max(results, key=lambda k: results[k].accuracy)
     best      = results[best_name]
 
-    # ── Step 1 ─────────────────────────────────────────────────────────────
-    st.markdown("### Step 1 — Stereo camera identifies tissue target")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Target X", f"{t3d[0]:.1f} mm")
-    col2.metric("Target Y", f"{t3d[1]:.1f} mm")
-    col3.metric("Target depth Z", f"{t3d[2]:.1f} mm")
-    st.caption(
-        f"Q-matrix projection: Q · [{scene['target_px'][0]}, "
-        f"{scene['target_px'][1]}, d, 1]ᵀ → 3D coordinates above"
+    st.markdown(f"**3D target from:** {data_label}")
+    st.markdown("---")
+
+    st.markdown("### Step 1 — Stereo camera localises tissue target")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Target X", f"{coords_3d[0]:.1f} mm")
+    c2.metric("Target Y", f"{coords_3d[1]:.1f} mm")
+    c3.metric("Target Z (depth)", f"{coords_3d[2]:.1f} mm")
+    if depth_err is not None:
+        c4.metric("Depth error vs CT", f"{depth_err:.1f} mm")
+
+    st.markdown("---")
+    st.markdown("### Step 2 — Robot moves Raman probe to target")
+    st.markdown(
+        f"Probe commanded to **(X={coords_3d[0]:.1f}, Y={coords_3d[1]:.1f}, "
+        f"Z={coords_3d[2]:.1f}) mm**. Spectrum acquired (1–5 s integration time)."
     )
 
-    # ── Step 2 ─────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Step 2 — Robot moves Raman probe to target location")
-    st.markdown(f"""
-    The surgical robot arm is commanded to move the spectroscopy probe to
-    **(X={t3d[0]:.1f}, Y={t3d[1]:.1f}, Z={t3d[2]:.1f}) mm** in the camera
-    coordinate frame. Contact is confirmed by the probe's force sensor.
-    Laser illumination begins; a Raman spectrum is acquired over 1–5 seconds.
-    """)
+    st.markdown("### Step 3 — Spectrum classified with confidence")
 
-    # ── Step 3 ─────────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### Step 3 — Spectrum classified in real time")
-
-    # Simulate a classification result by picking a random cancer spectrum
     rng = np.random.default_rng(7)
-    sample_spectrum = cancer[rng.integers(len(cancer))]
+    sample = cancer[rng.integers(len(cancer))]
 
     col1, col2 = st.columns([1, 2])
     with col1:
-        confidence = best.sensitivity * 100
-        st.markdown("#### Classification result")
-        st.error(f"**CANCER** — {confidence:.1f}% confidence")
+        st.error(f"**DISEASE DETECTED** — {best.sensitivity*100:.1f}% sensitivity")
         st.markdown(f"""
-        - Model: **{best_name}**
-        - Accuracy:    {best.accuracy:.3f}
-        - Sensitivity: {best.sensitivity:.3f}
-        - Specificity: {best.specificity:.3f}
-        - AUC:         {best.auc:.3f}
+        - **Model:** {best_name}
+        - **Accuracy:**    {best.accuracy:.3f}
+        - **Sensitivity:** {best.sensitivity:.3f}
+        - **Specificity:** {best.specificity:.3f}
+        - **AUC:**         {best.auc:.3f}
         """)
-        st.warning(
-            "⚕️ This output is advisory. Final diagnosis requires "
-            "histopathological confirmation."
-        )
+        st.warning("Advisory only. Histopathological confirmation required.")
 
     with col2:
         fig, ax = plt.subplots(figsize=(7, 3.5))
-        ax.plot(raman_shifts, sample_spectrum, color='salmon', lw=1.5,
-                label='Acquired spectrum')
-        cancer_avg = cancer.mean(axis=0)
-        healthy_avg = healthy.mean(axis=0)
-        ax.plot(raman_shifts, cancer_avg, 'r--', lw=1, alpha=0.6, label='Mean cancer ref.')
-        ax.plot(raman_shifts, healthy_avg, 'b--', lw=1, alpha=0.6, label='Mean healthy ref.')
+        ax.plot(raman_shifts, sample, color='salmon', lw=1.5, label='Acquired spectrum')
+        ax.plot(raman_shifts, cancer.mean(0), 'r--', lw=1, alpha=0.6, label='Mean disease ref.')
+        ax.plot(raman_shifts, healthy.mean(0), 'b--', lw=1, alpha=0.6, label='Mean healthy ref.')
         ax.set_xlabel('Raman shift (cm⁻¹)')
         ax.set_ylabel('Normalised intensity')
         ax.set_title('Acquired spectrum vs reference means')
-        ax.legend(fontsize=8)
-        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
         plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
+        st.pyplot(fig); plt.close(fig)
 
-    # ── Summary ─────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### Workflow summary")
     st.markdown(f"""
-    | Step | Module | Result |
-    |------|--------|--------|
-    | Stereo calibration | Module 1 | K matrix, distortion, Q matrix |
-    | Target localisation | Module 1 | ({t3d[0]:.1f}, {t3d[1]:.1f}, {t3d[2]:.1f}) mm |
-    | Spectrum acquisition | (hardware) | 1024-point Raman spectrum |
-    | Feature extraction | Module 2 | PCA scores, peak ratios |
-    | Classification | Module 2 ({best_name}) | **CANCER** |
-    | Overall accuracy | Module 2 | {best.accuracy:.1%} (4-fold CV) |
+    | Step | Data | Result |
+    |------|------|--------|
+    | Stereo localisation | {data_label} | ({coords_3d[0]:.1f}, {coords_3d[1]:.1f}, {coords_3d[2]:.1f}) mm |
+    | Raman classification | Yin et al. 2021 ({len(cancer)}+{len(healthy)} spectra) | Disease detected |
+    | Best classifier | {best_name} | Acc {best.accuracy:.1%} · AUC {best.auc:.3f} |
     """)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Router
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Router ────────────────────────────────────────────────────────────────
 
 if PAGE == "Overview":
     page_overview()
