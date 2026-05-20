@@ -394,3 +394,226 @@ def print_metrics_table(results: dict[str, ClassificationMetrics]) -> None:
               f"{m.sensitivity:>6.3f} {m.specificity:>6.3f} "
               f"{m.f_score:>6.3f} {m.auc:>6.3f}{marker}")
     print("=" * len(header))
+
+
+# ── Learning curves ────────────────────────────────────────────────────────
+
+def plot_learning_curves(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_folds: int = 4,
+) -> plt.Figure:
+    """
+    Plot accuracy vs training set size for each classifier.
+
+    A learning curve answers a question the assignment metrics can't:
+    how much does performance improve if we collect more data? It also
+    reveals overfitting — a model that achieves near-perfect training
+    accuracy but poor validation accuracy is memorising the training set.
+
+    How it works:
+      sklearn's learning_curve() trains each model repeatedly on
+      progressively larger subsets of the data (e.g. 10%, 25%, 50%,
+      75%, 100%) and records training and cross-validation accuracy at
+      each size. The shaded band shows ±1 std across CV folds.
+
+    What to look for:
+      - A large gap between train and CV curves = overfitting
+      - Both curves still rising at max data size = need more data
+      - CV curve plateauing = diminishing returns from more data
+    """
+    from sklearn.model_selection import learning_curve
+
+    classifiers = build_classifiers()
+    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    train_sizes = np.linspace(0.1, 1.0, 8)
+
+    n_clf = len(classifiers)
+    n_cols = 3
+    n_rows = (n_clf + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+    axes = np.array(axes).flatten()
+
+    colors = plt.cm.tab10(np.linspace(0, 1, n_clf))
+
+    for ax, (name, clf), color in zip(axes, classifiers.items(), colors):
+        train_sz, train_sc, val_sc = learning_curve(
+            clf, X, y,
+            cv=cv,
+            train_sizes=train_sizes,
+            scoring='accuracy',
+            n_jobs=-1,
+        )
+
+        train_mean = train_sc.mean(axis=1)
+        train_std  = train_sc.std(axis=1)
+        val_mean   = val_sc.mean(axis=1)
+        val_std    = val_sc.std(axis=1)
+
+        ax.plot(train_sz, train_mean, 'o-', color=color, label='Training')
+        ax.fill_between(train_sz,
+                         train_mean - train_std,
+                         train_mean + train_std,
+                         alpha=0.15, color=color)
+
+        ax.plot(train_sz, val_mean, 's--', color=color, alpha=0.7,
+                label='Cross-validation')
+        ax.fill_between(train_sz,
+                         val_mean - val_std,
+                         val_mean + val_std,
+                         alpha=0.1, color=color)
+
+        # Annotate final CV accuracy
+        ax.annotate(f'{val_mean[-1]:.3f}',
+                    xy=(train_sz[-1], val_mean[-1]),
+                    xytext=(8, 4), textcoords='offset points', fontsize=9)
+
+        ax.set_xlabel('Training set size (samples)')
+        ax.set_ylabel('Accuracy')
+        ax.set_title(name, fontsize=11)
+        ax.legend(fontsize=8)
+        ax.set_ylim(0.4, 1.05)
+        ax.grid(alpha=0.3)
+
+    for ax in axes[n_clf:]:
+        ax.set_visible(False)
+
+    plt.suptitle('Learning Curves — Accuracy vs Training Set Size', fontsize=14)
+    plt.tight_layout()
+    return fig
+
+
+# ── Uncertainty quantification ─────────────────────────────────────────────
+
+@dataclass
+class PredictionWithConfidence:
+    """
+    A prediction with associated confidence score.
+
+    label:       0 (healthy) or 1 (disease) — the hard prediction
+    confidence:  probability of the predicted class (0.5–1.0)
+    certain:     True if confidence >= threshold
+    raw_proba:   [P(healthy), P(disease)] — full probability vector
+    """
+    label:      np.ndarray
+    confidence: np.ndarray
+    certain:    np.ndarray
+    raw_proba:  np.ndarray
+
+
+def predict_with_confidence(
+    clf,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    threshold: float = 0.75,
+) -> PredictionWithConfidence:
+    """
+    Train a classifier and predict with confidence scores on test data.
+
+    Instead of returning a hard cancer/healthy label, this returns the
+    probability of the predicted class. Predictions below the confidence
+    threshold are flagged as 'uncertain' — in a real clinical system,
+    these would be referred for a second opinion or a different test
+    rather than acted on directly.
+
+    Why this matters clinically:
+      A 51% confident "cancer" prediction is very different from a 99%
+      confident one, but a standard classifier treats them identically.
+      Uncertainty quantification is what separates a decision-support tool
+      from a black box. A surgeon should know when the model is unsure.
+
+    Parameters
+    ----------
+    threshold:
+        Minimum confidence required to make a definitive prediction.
+        0.75 means "at least 75% confident in the predicted class".
+        Below this, the prediction is flagged as uncertain.
+        0.5 = always certain (same as standard classification).
+        0.9 = very conservative, many uncertain cases.
+    """
+    clf.fit(X_train, y_train)
+    proba = clf.predict_proba(X_test)           # (N, 2): [P(healthy), P(disease)]
+    labels = clf.predict(X_test)
+    confidence = proba.max(axis=1)              # confidence in the predicted class
+    certain = confidence >= threshold
+
+    return PredictionWithConfidence(
+        label=labels,
+        confidence=confidence,
+        certain=certain,
+        raw_proba=proba,
+    )
+
+
+def plot_confidence_distribution(
+    pred: PredictionWithConfidence,
+    y_true: np.ndarray,
+    threshold: float = 0.75,
+    title: str = "Confidence Distribution",
+) -> plt.Figure:
+    """
+    Visualise the confidence distribution for correct and incorrect predictions.
+
+    The key insight: well-calibrated classifiers should be most confident
+    when they are correct and least confident when they are wrong.
+    A good model's errors should cluster near the 0.5 decision boundary,
+    not at high confidence — high-confidence errors are the dangerous ones.
+
+    Two panels:
+      Left:  Histogram of confidence scores, split by correct/incorrect
+      Right: Scatter of P(disease) vs P(healthy), coloured by true label,
+             with the uncertainty region shaded
+    """
+    correct   = pred.label == y_true
+    incorrect = ~correct
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Panel 1: confidence histogram
+    bins = np.linspace(0.5, 1.0, 21)
+    ax1.hist(pred.confidence[correct],   bins=bins, alpha=0.7,
+             color='steelblue', label=f'Correct ({correct.sum()})')
+    ax1.hist(pred.confidence[incorrect], bins=bins, alpha=0.7,
+             color='salmon',    label=f'Incorrect ({incorrect.sum()})')
+    ax1.axvline(threshold, color='black', lw=2, linestyle='--',
+                label=f'Threshold = {threshold:.2f}')
+    ax1.set_xlabel('Confidence (P of predicted class)')
+    ax1.set_ylabel('Count')
+    ax1.set_title('Confidence: correct vs incorrect predictions')
+    ax1.legend(fontsize=9)
+    ax1.grid(alpha=0.3)
+
+    certain_pct = pred.certain.mean() * 100
+    ax1.text(0.03, 0.97, f'{certain_pct:.1f}% certain\n{100-certain_pct:.1f}% uncertain',
+             transform=ax1.transAxes, va='top', fontsize=10,
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+
+    # Panel 2: P(healthy) vs P(disease) scatter
+    c_mask = y_true == 1
+    h_mask = y_true == 0
+    ax2.scatter(pred.raw_proba[h_mask, 1], pred.raw_proba[h_mask, 0],
+                c='steelblue', alpha=0.5, s=25, label='Healthy (true)')
+    ax2.scatter(pred.raw_proba[c_mask, 1], pred.raw_proba[c_mask, 0],
+                c='salmon',    alpha=0.5, s=25, label='Disease (true)')
+
+    # Shade the uncertain region
+    uncertainty_zone = plt.Polygon(
+        [[0.5, 0.5], [threshold, 1-threshold], [1-threshold, threshold], [0.5, 0.5]],
+        alpha=0.1, color='grey',
+    )
+    ax2.add_patch(uncertainty_zone)
+    ax2.text(0.5, 0.5, f'Uncertain\n(< {threshold:.0%})', ha='center', va='center',
+             fontsize=8, color='grey', style='italic')
+
+    ax2.set_xlabel('P(disease)')
+    ax2.set_ylabel('P(healthy)')
+    ax2.set_title('Probability space — true labels')
+    ax2.legend(fontsize=9)
+    ax2.set_xlim(-0.02, 1.02)
+    ax2.set_ylim(-0.02, 1.02)
+    ax2.grid(alpha=0.3)
+
+    plt.suptitle(title, fontsize=13)
+    plt.tight_layout()
+    return fig
