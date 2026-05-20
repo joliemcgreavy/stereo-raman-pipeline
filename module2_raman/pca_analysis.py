@@ -108,12 +108,21 @@ def run_pca_correlation(
     data = np.vstack([healthy_sub, cancer_sub])   # (N, n_wavenumbers_in_range)
     labels = np.array([0] * len(healthy) + [1] * len(cancer))
 
+    # Remove constant columns (zero variance) before standardising.
+    # Real instruments often record zeros at the spectrum edges where the
+    # detector has no sensitivity. A column of all-zeros has std=0, causing
+    # divide-by-zero in both StandardScaler and np.corrcoef, producing NaN
+    # values that corrupt the entire eigendecomposition.
+    col_std = data.std(axis=0)
+    active  = col_std > 1e-10
+    data    = data[:, active]
+
     # Standardise each wavenumber channel (column) to zero mean, unit variance.
     # This is important because wavenumber channels have different mean intensities.
     # Without standardisation, high-intensity peaks would dominate the correlation
     # structure regardless of how discriminative they are.
     scaler = StandardScaler()
-    data_std = scaler.fit_transform(data)   # (N, n_wavenumbers_in_range)
+    data_std = scaler.fit_transform(data)   # (N, n_active_wavenumbers)
 
     # Correlation matrix: (n_wavenumbers × n_wavenumbers)
     # Each entry [i,j] is the Pearson correlation between wavenumber i and j

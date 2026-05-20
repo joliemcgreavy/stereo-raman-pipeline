@@ -23,7 +23,19 @@ in the directories shown.
 
 ## Module 2 — Raman Spectroscopy
 
-### MDA-MB-231 Cancer Cell Dataset
-- **Source**: RamanSPy (Imperial College London Barahona Research Group)
-- **Paper**: Scandinavian et al., *Analytical Chemistry*, 2024
-- **Download**: Automatic via `ramanspy.datasets.MDA_MB_231_cells()` — no manual download needed.
+### COVID-19 Serum Raman Dataset (primary — already downloaded)
+- **Paper**: Yin G. et al., *Journal of Raman Spectroscopy*, 52(5), 949–958 (2021)
+- **Source**: https://figshare.com/articles/dataset/12159924
+- **Licence**: CC BY 4.0 (open access)
+- **Files**: `data/raw/raman_covid/raw_COVID.txt`, `raw_Healthy.txt`, `Raman_shift.txt`
+- **Download** (if files are missing):
+  ```bash
+  mkdir -p data/raw/raman_covid && cd data/raw/raman_covid
+  curl -L -o raw_COVID.txt   https://ndownloader.figshare.com/files/22386432
+  curl -L -o raw_Healthy.txt https://ndownloader.figshare.com/files/22386435
+  curl -L -o data.mat        https://ndownloader.figshare.com/files/22386411
+  python3 -c "import scipy.io,numpy; d=scipy.io.loadmat('data.mat'); numpy.savetxt('Raman_shift.txt', d['wave_number'].ravel())"
+  ```
+- **Note**: Two classes — COVID-positive (disease, n=159) and healthy controls (n=150).
+  Directly analogous to the cancer vs healthy classification task.
+  Spectral range 400–2112 cm⁻¹, 900 wavenumber points.

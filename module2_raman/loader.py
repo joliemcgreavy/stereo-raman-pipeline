@@ -3,12 +3,17 @@ Raman spectroscopy data loading and preprocessing.
 
 The assignment loaded two fixed .txt files (AT1_data_norm.txt for cancer,
 Fibro_data_norm.txt for healthy) that had already been normalised by the
-course team. Here we do the same thing but with three options:
+course team. Here we do the same thing but with four options:
 
-  1. RamanSPy (primary) — loads the MDA-MB-231 breast cancer cell imaging
-     dataset directly from Imperial College London's Barahona Research Group.
-     Because this is a spatial imaging dataset (each pixel is a spectrum),
-     we extract per-pixel spectra and label them by cell region.
+  1. COVID-19 serum Raman (primary real dataset) — Yin et al. (2021),
+     Journal of Raman Spectroscopy. 159 COVID-positive and 150 healthy
+     serum spectra, 400–2112 cm⁻¹. Directly analogous to the cancer vs
+     healthy classification task in the assignment. Downloaded from Figshare
+     (public, no login required). See data/README.md for instructions.
+
+  2. RamanSPy — loads datasets via the Imperial College London Barahona
+     Research Group's open-source library. Note: all RamanSPy datasets
+     require manual pre-download; see ramanspy.readthedocs.io/datasets.
 
   2. Synthetic (fallback / demo) — generates realistic cancer vs healthy
      spectra from published tissue Raman peak positions. Useful for running
@@ -76,7 +81,72 @@ class RamanDataset:
         return X, y
 
 
-# ── Option 1: RamanSPy ─────────────────────────────────────────────────────
+# ── Option 1: COVID-19 serum Raman (Yin et al. 2021) ──────────────────────
+
+def load_covid_raman(
+    data_dir: Path | str | None = None,
+) -> RamanDataset:
+    """
+    Load the Yin et al. (2021) COVID-19 serum Raman dataset.
+
+    Published in: Journal of Raman Spectroscopy, 52(5), 949–958.
+    Source: https://figshare.com/articles/dataset/12159924
+
+    Two classes:
+      - COVID-positive serum  → used as the "disease" class (159 spectra)
+      - Healthy control serum → used as the "healthy" class (150 spectra)
+
+    This is directly analogous to the cancer vs healthy classification in
+    the assignment. The technique (serum Raman spectroscopy) and the
+    analytical task (binary classification from spectral features) are
+    identical; the biological substrate is serum rather than tissue.
+
+    Spectral range: 400–2112 cm⁻¹, 900 wavenumber points.
+
+    Download instructions (data/README.md):
+      The three required files are already downloaded if you ran the
+      setup script. They live in data/raw/raman_covid/:
+        raw_COVID.txt      — 159 COVID spectra  (900 wavenumbers × 159 cols)
+        raw_Healthy.txt    — 150 healthy spectra (900 wavenumbers × 150 cols)
+        Raman_shift.txt    — 900 wavenumber values
+
+    Parameters
+    ----------
+    data_dir:
+        Path to the folder containing the three .txt files.
+        Defaults to data/raw/raman_covid/ relative to the project root.
+    """
+    if data_dir is None:
+        # Navigate from this file's location up to project root, then to data
+        data_dir = Path(__file__).parent.parent / 'data' / 'raw' / 'raman_covid'
+    data_dir = Path(data_dir)
+
+    required = ['raw_COVID.txt', 'raw_Healthy.txt', 'Raman_shift.txt']
+    missing  = [f for f in required if not (data_dir / f).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing files in {data_dir}: {missing}\n"
+            f"See data/README.md for download instructions."
+        )
+
+    # Each file is (wavenumbers × spectra) — same layout as assignment .txt files.
+    # Transpose to (spectra × wavenumbers) which is scikit-learn's convention.
+    covid_raw   = np.loadtxt(data_dir / 'raw_COVID.txt').T    # (159, 900)
+    healthy_raw = np.loadtxt(data_dir / 'raw_Healthy.txt').T  # (150, 900)
+    shifts      = np.loadtxt(data_dir / 'Raman_shift.txt').ravel()
+
+    # The spectra are already baseline-corrected and normalised by the
+    # original authors. We apply L2 normalisation on top to ensure unit
+    # norm, which makes the data consistent with load_synthetic() output.
+    return RamanDataset(
+        cancer=normalise_spectra(covid_raw),
+        healthy=normalise_spectra(healthy_raw),
+        raman_shifts=shifts,
+        source="Yin et al. (2021) COVID-19 serum Raman — Figshare/JRS",
+    )
+
+
+# ── Option 2: RamanSPy ─────────────────────────────────────────────────────
 
 def load_ramanspy() -> RamanDataset:
     """

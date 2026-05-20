@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import streamlit as st
 
-from module2_raman.loader import load_synthetic
+from module2_raman.loader import load_synthetic, load_covid_raman
 from module2_raman.peak_analysis import (
     plot_mean_spectra,
     find_discriminative_peaks,
@@ -95,8 +95,14 @@ st.sidebar.markdown(
 # arguments return the cached result instantly.
 
 @st.cache_data
-def _load_raman(n_cancer: int, n_healthy: int) -> tuple:
-    ds = load_synthetic(n_cancer=n_cancer, n_healthy=n_healthy)
+def _load_raman(source: str = 'real', n_cancer: int = 120, n_healthy: int = 120) -> tuple:
+    if source == 'real':
+        try:
+            ds = load_covid_raman()
+        except FileNotFoundError:
+            ds = load_synthetic(n_cancer=n_cancer, n_healthy=n_healthy)
+    else:
+        ds = load_synthetic(n_cancer=n_cancer, n_healthy=n_healthy)
     return ds.cancer, ds.healthy, ds.raman_shifts, ds.source
 
 
@@ -460,14 +466,18 @@ def page_raman() -> None:
     # ── Data controls ──────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown("### Module 2 Settings")
-        n_each = st.slider("Spectra per class", 40, 200, 120, 20,
-                           help="More spectra = slower but more reliable classification")
-        st.caption(
-            "Using synthetic tissue spectra (peaks from Movasaghi et al. 2007). "
-            "Swap `load_synthetic()` for `load_ramanspy()` to use real MDA-MB-231 data."
+        data_source = st.radio(
+            "Data source",
+            ['Real (Yin et al. 2021)', 'Synthetic (demo)'],
+            help="Real = COVID-19 serum Raman from Figshare. Synthetic = generated from published peak positions."
         )
+        use_real = data_source.startswith('Real')
+        n_each = st.slider("Spectra per class (synthetic only)", 40, 200, 120, 20,
+                           disabled=use_real)
 
-    cancer, healthy, raman_shifts, source = _load_raman(n_each, n_each)
+    cancer, healthy, raman_shifts, source = _load_raman(
+        'real' if use_real else 'synthetic', n_each, n_each
+    )
 
     st.info(f"**Dataset:** {source} — {n_each} cancer spectra, {n_each} healthy spectra, "
             f"{len(raman_shifts)} wavenumber points ({raman_shifts[0]:.0f}–{raman_shifts[-1]:.0f} cm⁻¹)")
