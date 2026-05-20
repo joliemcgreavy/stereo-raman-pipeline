@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data — raw datasets are never committed to Git.
+# Large binary files will exceed GitHub's 100MB limit and expose data
+# that may have license restrictions. Instead, data/README.md explains
+# how to download each dataset yourself.
+data/raw/
+data/processed/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml

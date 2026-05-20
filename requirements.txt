@@ -1,0 +1,41 @@
+# Core numerical computing
+numpy>=1.26
+scipy>=1.13
+
+# Computer vision — OpenCV is the Python-standard equivalent of MATLAB's
+# Computer Vision Toolbox. The headless variant skips GUI dependencies,
+# which makes it safe to install on servers and in CI environments.
+opencv-python-headless>=4.9
+
+# Machine learning — scikit-learn is the Python equivalent of MATLAB's
+# Statistics and Machine Learning Toolbox. Provides SVM, KNN, Random Forest,
+# cross-validation, confusion matrix, ROC/AUC out of the box.
+scikit-learn>=1.5
+
+# Raman spectroscopy — RamanSPy is an open-source Python package from
+# Imperial College London's Barahona Research Group (published in
+# Analytical Chemistry, 2024). Provides the MDA-MB-231 cancer cell dataset
+# and Raman-specific preprocessing tools.
+ramanspy>=0.3
+
+# Data handling
+pandas>=2.2
+
+# Visualisation
+matplotlib>=3.9
+seaborn>=0.13
+plotly>=5.22
+
+# 3D point cloud visualisation
+open3d>=0.18
+
+# Interactive dashboard (Module 3)
+streamlit>=1.35
+
+# Notebook support
+jupyter>=1.0
+notebook>=7.0
+ipykernel>=6.0
+
+# Testing
+pytest>=8.0
