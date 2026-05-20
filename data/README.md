@@ -8,13 +8,22 @@ in the directories shown.
 
 ## Module 1 — Stereo Vision
 
-### SERV-CT (stereo calibration + ground-truth depth)
-- **Paper**: Psychogyios et al., *Medical Image Analysis*, 2022
-- **Source**: https://arxiv.org/abs/2012.11779
-- **Download**: https://www.ucl.ac.uk/interventional-surgical-sciences/serv-ct
-- **Place in**: `data/raw/serv_ct/`
+### SERV-CT (primary — already downloaded)
+- **Paper**: Psychogyios et al., *Medical Image Analysis* (2022)
+- **Source**: https://rdr.ucl.ac.uk/articles/dataset/26352199
+- **Licence**: CC BY 4.0 (open access, no registration required)
+- **Files**: `data/raw/serv_ct/SERV-CT/` (16 stereo pairs, calibration JSONs, CT depth maps)
+- **Download** (if files are missing):
+  ```bash
+  mkdir -p data/raw/serv_ct && cd data/raw/serv_ct
+  curl -L -o SERV-CT.zip https://ndownloader.figshare.com/files/47857471
+  unzip SERV-CT.zip && rm SERV-CT.zip
+  ```
+- **Contents**: 16 rectified stereo pairs (720×576), Q matrix calibration JSONs,
+  CT ground-truth depth and disparity maps, occlusion masks.
+  Depth range ~60–95mm. Ex vivo porcine tissue, da Vinci™ endoscope.
 
-### Hamlyn Centre Rectified Stereo Dataset (in vivo surgery)
+### Hamlyn Centre Rectified Stereo Dataset (in vivo surgery — optional extension)
 - **Source**: http://hamlyn.doc.ic.ac.uk/vision/
 - **Hugging Face mirror**: https://huggingface.co/datasets/Recasens/HamlynRectifiedDataset
 - **Place in**: `data/raw/hamlyn/`
