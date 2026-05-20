@@ -33,6 +33,8 @@ import plotly.graph_objects as go
 import cv2
 import streamlit as st
 
+from data.downloader import ensure_all
+
 # Module 1
 from module1_stereo.disparity import compute_disparity_sgbm
 from module1_stereo.reconstruction import reproject_to_3d, reproject_single_point, filter_point_cloud
@@ -84,8 +86,20 @@ st.sidebar.markdown(
     "[GitHub →](https://github.com/joliemcgreavy/stereo-raman-pipeline)"
 )
 
+# ── Data availability ─────────────────────────────────────────────────────
+# On Streamlit Community Cloud the data/ directory is empty on first deploy.
+# ensure_all() downloads both datasets if absent and shows a status spinner.
+# On local runs where files already exist, this returns instantly.
+
+@st.cache_resource
+def _bootstrap_data() -> dict:
+    with st.status("Checking datasets...", expanded=False) as s:
+        return ensure_all(status=s)
+
+_data_status = _bootstrap_data()
+
 SERV_CT_DIR = Path(__file__).parent.parent / 'data' / 'raw' / 'serv_ct' / 'SERV-CT'
-SERV_CT_AVAILABLE = SERV_CT_DIR.exists()
+SERV_CT_AVAILABLE = SERV_CT_DIR.exists() and _data_status.get('serv_ct', False)
 
 ALL_FRAME_IDS = [f'{n:03d}' for n in range(1, 17)]
 
