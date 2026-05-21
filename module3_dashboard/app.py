@@ -252,14 +252,24 @@ def page_overview() -> None:
 
     st.markdown("---")
     st.markdown("### Surgical workflow")
-    st.markdown("""
-1. Stereo endoscope captures tissue surface
-2. SGBM disparity map → Q-matrix projection → **3D target coordinates (X, Y, Z)**
-3. Robot moves Raman probe to that location
-4. Spectrum acquired (1–5 s integration)
-5. PCA feature extraction → ML classifier
-6. **DISEASE / HEALTHY** + confidence score reported to surgeon
-    """)
+    st.code("""\
+Stereo endoscope sees tissue surface
+            │
+            ▼
+SGBM disparity map → Q-matrix projection → 3D target (X, Y, Z)
+            │
+            ▼
+Robot moves Raman probe to (X, Y, Z)
+            │
+            ▼
+Spectrum acquired (1–5 s integration)
+            │
+            ▼
+PCA feature extraction → ML classifier
+            │
+            ▼
+DISEASE / HEALTHY  +  confidence score  →  surgeon
+""", language=None)
 
 
 def page_stereo() -> None:
