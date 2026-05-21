@@ -11,9 +11,7 @@ pinned: false
 
 **Stereo 3D reconstruction and Raman spectroscopy tissue classification for surgical robotics**
 
-[![Live Demo](https://img.shields.io/badge/🤗%20Live%20Demo-HF%20Spaces-blue)](https://huggingface.co/spaces/joliemcgreavy/stereo-raman-pipeline)
-[![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)](#)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+**[Live demo →](https://huggingface.co/spaces/joliemcgreavy/stereo-raman-pipeline)** · MIT licence · 43 tests passing
 
 ---
 
