@@ -248,20 +248,17 @@ def page_overview() -> None:
     c1.metric("Module 2 accuracy", "94.8%", "Random Forest, 4-fold CV")
     c2.metric("Module 2 AUC", "0.980", "Real serum Raman data")
     c3.metric("Module 1 depth MAE", "~5 mm", "SGBM vs CT ground truth")
-    c4.metric("Test suite", "43 / 43", "All passing")
+    c4.metric("Test suite", "74 / 74", "All passing")
 
     st.markdown("---")
+    st.markdown("### Surgical workflow")
     st.markdown("""
-    ### Surgical workflow
-    ```
-    Stereo endoscope → SGBM disparity → Q-matrix projection → 3D tissue target
-                                                                     │
-                                   Robot moves Raman probe to (X,Y,Z)
-                                                                     │
-                                   Spectrum acquired → PCA features → Classifier
-                                                                     │
-                                   DISEASE / HEALTHY + confidence score → surgeon
-    ```
+1. Stereo endoscope captures tissue surface
+2. SGBM disparity map → Q-matrix projection → **3D target coordinates (X, Y, Z)**
+3. Robot moves Raman probe to that location
+4. Spectrum acquired (1–5 s integration)
+5. PCA feature extraction → ML classifier
+6. **DISEASE / HEALTHY** + confidence score reported to surgeon
     """)
 
 
