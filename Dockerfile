@@ -12,8 +12,8 @@ WORKDIR /app
 
 # Install Python dependencies first — this layer is cached so rebuilds
 # after code-only changes are fast (pip install doesn't re-run)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements-deploy.txt .
+RUN pip install --no-cache-dir -r requirements-deploy.txt
 
 # Copy the rest of the project
 COPY . .
