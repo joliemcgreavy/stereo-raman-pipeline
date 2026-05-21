@@ -1,3 +1,12 @@
+---
+title: Stereo Raman Pipeline
+emoji: 🔬
+colorFrom: blue
+colorTo: red
+sdk: docker
+pinned: false
+---
+
 # stereo-raman-pipeline — Stereo 3D Reconstruction & Raman Tissue Classification
 
 A Python pipeline demonstrating two core perception tasks for next-generation surgical robots:
