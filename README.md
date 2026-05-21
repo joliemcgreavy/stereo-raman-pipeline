@@ -7,81 +7,122 @@ sdk: docker
 pinned: false
 ---
 
-# stereo-raman-pipeline — Stereo 3D Reconstruction & Raman Tissue Classification
+# stereo-raman-pipeline
 
-A Python pipeline demonstrating two core perception tasks for next-generation surgical robots:
+**Stereo 3D reconstruction and Raman spectroscopy tissue classification for surgical robotics**
 
-1. **Stereo 3D reconstruction** — calibrate a stereo endoscopic camera pair, estimate depth from disparity, and localise a target tissue region in 3D space
-2. **Raman spectral tissue classification** — load cancer and healthy cell spectra, extract discriminative features via PCA, and compare supervised ML classifiers
-
-The two modules mirror a real clinical workflow: the robot's stereo camera identifies *where* a suspicious tissue region is, and a co-located Raman spectroscopy probe characterises *what* it is.
-
----
-
-## Background
-
-This project translates concepts from a Clinical Engineering and Surgical Robotics module at Imperial College London into an open-source, reproducible Python pipeline. The original coursework used MATLAB GUI tools (Stereo Camera Calibrator, Classification Learner); this project reimplements every step programmatically using industry-standard Python libraries.
+[![Live Demo](https://img.shields.io/badge/🤗%20Live%20Demo-HF%20Spaces-blue)](https://huggingface.co/spaces/joliemcgreavy/stereo-raman-pipeline)
+[![Tests](https://img.shields.io/badge/tests-43%20passing-brightgreen)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
-## Pipeline Overview
+## Overview
 
-```
-Stereo images (SERV-CT / Hamlyn)          Raman spectra (MDA-MB-231 cells)
-        │                                          │
-        ▼                                          ▼
- Module 1: Stereo Vision                  Module 2: Spectral Analysis
- ├── Stereo calibration (OpenCV)          ├── Mean ± std visualisation
- ├── Intrinsic/extrinsic parameters       ├── Manual peak analysis
- ├── Single-image pose estimation         ├── PCA (range optimisation)
- ├── Disparity map                        └── SVM / KNN / RF classifiers
- └── Q-matrix → 3D target coordinates         (Acc, Precision, Sensitivity,
-                                               Specificity, F-score, ROC/AUC)
-        │                                          │
-        └──────────────┬───────────────────────────┘
-                       ▼
-              Module 3: Streamlit Dashboard
-              (3D scene + classification results)
-```
+An end-to-end Python pipeline demonstrating two core perception tasks for next-generation surgical robots:
+
+1. **Stereo 3D reconstruction** — load a rectified stereo endoscope image pair, compute a dense disparity map using SGBM, project to 3D via the Q matrix, and localise a target tissue region in millimetre coordinates. Validated against CT ground truth.
+
+2. **Raman spectral tissue classification** — load real serum Raman spectra, apply baseline correction and cosmic ray removal, extract PCA features, train and compare six ML classifiers, and output a prediction with confidence score.
+
+The two modules reflect a real clinical workflow: the stereo camera identifies *where* a suspicious region is; the Raman probe characterises *what* it is.
+
+---
+
+## Live Demo
+
+**[→ Open the interactive dashboard](https://huggingface.co/spaces/joliemcgreavy/stereo-raman-pipeline)**
+
+The dashboard runs all modules live, including:
+- SERV-CT stereo frame selector (16 real endoscope image pairs)
+- SGBM disparity map vs CT ground-truth validation
+- Interactive 3D point cloud with selectable tissue target
+- Raman classification on real published data
+- Preprocessing, learning curves, and uncertainty quantification tabs
+
+---
+
+## Results
+
+| Module | Metric | Value |
+|--------|--------|-------|
+| Stereo (Module 1) | Disparity MAE vs CT | ~3–5 px |
+| Stereo (Module 1) | Depth MAE vs CT | ~5 mm |
+| Raman (Module 2) | Best classifier accuracy | **94.8%** (Random Forest) |
+| Raman (Module 2) | AUC | **0.980** |
+| Raman (Module 2) | Sensitivity | 0.912 |
+| Raman (Module 2) | Specificity | 0.987 |
+| Test suite | | 43 / 43 passing |
 
 ---
 
 ## Datasets
 
-| Module | Dataset | Source |
-|--------|---------|--------|
-| Stereo calibration | SERV-CT | UCL / arXiv 2012.11779 |
-| Stereo 3D scene | Hamlyn Centre Endoscopic Dataset | Imperial College London |
-| Raman spectroscopy | MDA-MB-231 breast cancer cells | RamanSPy / Imperial Barahona Group |
+| Module | Dataset | Source | Licence |
+|--------|---------|--------|---------|
+| Stereo | SERV-CT — 16 rectified stereo pairs, ex vivo porcine tissue, da Vinci™ endoscope, CT ground-truth depth | [UCL / Psychogyios et al. 2022](https://rdr.ucl.ac.uk/articles/dataset/26352199) | CC BY 4.0 |
+| Raman | Yin et al. 2021 — 309 serum Raman spectra (159 disease, 150 healthy), 400–2112 cm⁻¹ | [Figshare / J. Raman Spectrosc.](https://figshare.com/articles/dataset/12159924) | CC BY 4.0 |
 
-See `data/README.md` for download instructions. Raw data is not committed to this repository.
+Both datasets are downloaded automatically on first run. See `data/README.md` for manual download instructions.
+
+---
+
+## Pipeline
+
+```
+Stereo image pair (SERV-CT)           Raman spectra (Yin et al. 2021)
+        │                                       │
+        ▼                                       ▼
+Module 1: Stereo Vision               Module 2: Spectral Analysis
+├── Calibration (Q, P1, P2)           ├── Baseline correction (ALS)
+├── SGBM disparity map                ├── Cosmic ray removal
+├── CT ground-truth validation        ├── Mean ± std visualisation
+├── Q-matrix → 3D coordinates         ├── Manual peak analysis
+└── Interactive 3D point cloud        ├── PCA range optimisation
+                                      ├── SVM / KNN / RF / NB / DT / LR
+                                      ├── Confusion matrix, ROC, AUC
+                                      ├── Learning curves
+                                      └── Uncertainty quantification
+        │                                       │
+        └─────────────┬─────────────────────────┘
+                      ▼
+           Module 3: Streamlit Dashboard
+           Interactive stereo + classification results
+```
 
 ---
 
 ## Project Structure
 
 ```
-surgical-vision-pipeline/
-├── module1_stereo/          # Stereo vision Python modules
-│   ├── calibration.py
-│   ├── pose_estimation.py
-│   ├── disparity.py
-│   └── reconstruction.py
-├── module2_raman/           # Raman spectroscopy Python modules
-│   ├── loader.py
-│   ├── peak_analysis.py
-│   ├── pca_analysis.py
-│   └── classification.py
-├── module3_dashboard/       # Streamlit app
-│   └── app.py
-├── notebooks/               # Step-by-step annotated notebooks
+stereo-raman-pipeline/
+├── module1_stereo/
+│   ├── calibration.py        stereo calibration from checkerboard images
+│   ├── pose_estimation.py    single-image probe distance estimation (solvePnP)
+│   ├── disparity.py          SGBM dense disparity + manual single-point
+│   ├── reconstruction.py     Q-matrix reprojection to 3D
+│   ├── serv_ct_loader.py     SERV-CT dataset loader (images, calibration, GT)
+│   └── validation.py         MAE, RMSE, >1px vs CT ground truth
+├── module2_raman/
+│   ├── loader.py             COVID-19 Raman loader + synthetic fallback
+│   ├── preprocessing.py      ALS baseline correction, cosmic ray removal
+│   ├── peak_analysis.py      mean spectra, peak selection, C:H ratios
+│   ├── pca_analysis.py       correlation matrix PCA, range optimisation
+│   └── classification.py     6 classifiers, all metrics, learning curves, uncertainty
+├── module3_dashboard/
+│   └── app.py                Streamlit dashboard (7 Module 2 tabs, real stereo data)
+├── notebooks/
 │   ├── 01_stereo_calibration.ipynb
-│   ├── 02_3d_reconstruction.ipynb
+│   ├── 02_stereo_real_data.ipynb
 │   ├── 03_raman_analysis.ipynb
+│   ├── 03b_raman_extensions.ipynb
 │   └── 04_dashboard_integration.ipynb
-├── tests/                   # Unit tests
-├── data/                    # Data directory (raw data not committed)
-└── requirements.txt
+├── data/
+│   ├── downloader.py         auto-downloads datasets on first run
+│   └── README.md             manual download instructions
+└── tests/
+    ├── test_calibration.py   14 tests — disparity, Q-matrix, point cloud
+    └── test_classification.py 29 tests — loader, PCA, metrics, classifiers
 ```
 
 ---
@@ -89,46 +130,40 @@ surgical-vision-pipeline/
 ## Setup
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/surgical-vision-pipeline
-cd surgical-vision-pipeline
+git clone https://github.com/joliemcgreavy/stereo-raman-pipeline
+cd stereo-raman-pipeline
 
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
 ```
 
-Then follow `data/README.md` to download the datasets.
-
----
-
-## Usage
-
-Run notebooks interactively:
-```bash
-jupyter notebook notebooks/
-```
-
-Run the Streamlit dashboard:
+**Run the dashboard:**
 ```bash
 streamlit run module3_dashboard/app.py
 ```
+Datasets download automatically on first launch (~40MB total).
 
-Run tests:
+**Run the notebooks:**
 ```bash
-pytest tests/
+pip install jupyter
+jupyter notebook notebooks/
+```
+
+**Run the tests:**
+```bash
+pytest tests/ -v
 ```
 
 ---
 
 ## Tech Stack
 
-Python 3.10+ · OpenCV · NumPy · SciPy · scikit-learn · RamanSPy · Open3D · Matplotlib · Plotly · Streamlit
+Python 3.11 · OpenCV · NumPy · SciPy · scikit-learn · Matplotlib · Plotly · Streamlit
 
 ---
 
-## Acknowledgements
+## Background
 
-- [RamanSPy](https://ramanspy.readthedocs.io) — Barahona Research Group, Imperial College London
-- [Hamlyn Centre Dataset](http://hamlyn.doc.ic.ac.uk/vision/) — Hamlyn Centre, Imperial College London
-- [SERV-CT](https://arxiv.org/abs/2012.11779) — Psychogyios et al., UCL
+Developed as part of graduate study in Clinical Engineering and Surgical Robotics at Imperial College London. Translates concepts from stereo camera calibration and Raman spectral classification into an open-source Python pipeline using published open datasets from the UCL and Imperial research communities.
